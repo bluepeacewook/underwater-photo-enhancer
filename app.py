@@ -266,252 +266,165 @@ def dark_channel_defog(bgr: np.ndarray, strength: float = 0.55) -> np.ndarray:
     num_px = max(int(dark.size * 0.001), 1)
     flat = dark.ravel()
     indices = np.argpartition(flat, -num_px)[-num_px:]
-    atm_mask = np.zeros_like(dark)
-    atm_mask.ravel()[indices] = 1
-    atm = np.array([
-        img[:, :, c][atm_mask == 1].mean() for c in range(3)
-    ], dtype=np.float32)
-
-    # 투과률 t 추정 (BGR의 반색으로 조정)
-    omega = 0.95
-    t = 1.0 - omega * dark / (atm.max() + 1e-6)
-    t = np.clip(t, 0.1, 1.0)
-
-    # 복원: J = (I - A) / t + A, strength로 보간
-    result = np.zeros_like(img)
-    for c in range(3):
-        result[:, :, c] = (img[:, :, c] - atm[c]) / (t + 1e-6) + atm[c]
-    result = np.clip(result, 0, 1)
-
-    # strength 바랙으로 원본과 혼합
-    blended = img * (1 - strength) + result * strength
-    return np.clip(blended * 255.0, 0, 255).astype(np.uint8)
+    atm_mask = np.zeros_like(flat, dtype=bool)
+    atm_mask[indices] = True
+    atm_mask = atm_mask.reshape(dark.shape)
+    A = float(img[atm_mask].mean(axis=0).mean())
+    A = max(A, 0.6)
+    # 투과율
+    t = 1.0 - strength * dark / max(A, 1e-6)
+    t = np.clip(t, 0.25, 1.0)
+    t3 = t[:, :, np.newaxis]
+    # 복원
+    result = (img - A) / t3 + A
+    return np.clip(result * 255.0, 0, 255).astype(np.uint8)
 
 
 # ────────────────────────────────────────────────
-# 6단계 수중 보정 파이프라인
+# 메인 보정 파이프라인
 # ────────────────────────────────────────────────
 
 def enhance_underwater(pil_img: Image.Image, params: dict) -> Image.Image:
     """
-    수중 사진 보정 6단계 파이프라인.
-    인물(얼굴, 표정, 체형, 장비)의 픽셀 일체 변형 없음.
-    색상 채널만 수학적으로 보정합니다.
+    6단계 수중 보정 파이프라인:
+    1. 채널 레벨 보정 (적색 보상 + 녹/청색 억제)
+    2. 다크 채널 디포그
+    3. CLAHE (L채널 명암 대비)
+    4. 언샤프 마스크 (선명도)
+    5. HSV 채도 부스트
+    6. 워밍 커브 (피부톤)
     """
+    p = params
     bgr = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
 
-    # ----- STEP 1: 채널색 레벨 보정 -----
-    # 적색 상승, 녹색·청색 억제
-    lut = np.arange(256, dtype=np.float32)
-    r_lut = np.clip(lut * params["red_boost"],   0, 255).astype(np.uint8)
-    g_lut = np.clip(lut * params["green_suppress"], 0, 255).astype(np.uint8)
-    b_lut = np.clip(lut * params["blue_suppress"],  0, 255).astype(np.uint8)
+    # ── STEP 1: 채널 레벨 보정 ──
+    img_f = bgr.astype(np.float32)
+    img_f[:, :, 2] = np.clip(img_f[:, :, 2] * p["red_boost"], 0, 255)       # R↑
+    img_f[:, :, 1] = np.clip(img_f[:, :, 1] * p["green_suppress"], 0, 255)  # G↓
+    img_f[:, :, 0] = np.clip(img_f[:, :, 0] * p["blue_suppress"], 0, 255)   # B↓
+    bgr = img_f.astype(np.uint8)
 
-    b, g, r = cv2.split(bgr)
-    bgr = cv2.merge([
-        cv2.LUT(b, b_lut),
-        cv2.LUT(g, g_lut),
-        cv2.LUT(r, r_lut),
-    ])
+    # ── STEP 2: 디포그 ──
+    bgr = dark_channel_defog(bgr, p["defog_strength"])
 
-    # ----- STEP 2: 다크 채널 디포그 -----
-    bgr = dark_channel_defog(bgr, strength=params["defog_strength"])
-
-    # ----- STEP 3: CLAHE (LAB L-채널) -----
+    # ── STEP 3: CLAHE (LAB 명도 채널) ──
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    l, a, b_ch = cv2.split(lab)
-    clahe = cv2.createCLAHE(
-        clipLimit=params["clahe_clip"],
-        tileGridSize=(8, 8)
-    )
-    l = clahe.apply(l)
-    bgr = cv2.cvtColor(cv2.merge([l, a, b_ch]), cv2.COLOR_LAB2BGR)
+    l, a, ch_b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=p["clahe_clip"], tileGridSize=(8, 8))
+    l_eq = clahe.apply(l)
+    bgr = cv2.cvtColor(cv2.merge([l_eq, a, ch_b]), cv2.COLOR_LAB2BGR)
 
-    # ----- STEP 4: 언샤프 마스크 (선명도 향상) -----
-    blurred = cv2.GaussianBlur(bgr, (0, 0), sigmaX=2.5)
-    amt = params["unsharp_amount"]
-    bgr = cv2.addWeighted(bgr, 1.0 + amt, blurred, -amt, 0)
-    bgr = np.clip(bgr, 0, 255).astype(np.uint8)
+    # ── STEP 4: 언샤프 마스크 ──
+    amount = p["unsharp_amount"]
+    blur = cv2.GaussianBlur(bgr, (0, 0), 1.5)
+    bgr = cv2.addWeighted(bgr, 1 + amount, blur, -amount, 0)
 
-    # ----- STEP 5: HSV 채도 부스트 -----
+    # ── STEP 5: HSV 채도 부스트 ──
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * params["saturation_boost"], 0, 255)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * p["saturation_boost"], 0, 255)
     bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
-    # ----- STEP 6: 워밍 LUT (피부톤 워밍) -----
-    w = params["warmth"]
-    r_warm = np.clip(lut + w * 255, 0, 255).astype(np.uint8)
-    b_cool = np.clip(lut - w * 128, 0, 255).astype(np.uint8)
-    b2, g2, r2 = cv2.split(bgr)
-    bgr = cv2.merge([
-        cv2.LUT(b2, b_cool),
-        g2,
-        cv2.LUT(r2, r_warm),
-    ])
+    # ── STEP 6: 워밍 커브 (LUT) ──
+    warmth = p["warmth"]
+    lut_r = np.clip(np.arange(256, dtype=np.float32) * (1 + warmth), 0, 255).astype(np.uint8)
+    lut_b = np.clip(np.arange(256, dtype=np.float32) * (1 - warmth * 0.5), 0, 255).astype(np.uint8)
+    bgr[:, :, 2] = cv2.LUT(bgr[:, :, 2], lut_r)
+    bgr[:, :, 0] = cv2.LUT(bgr[:, :, 0], lut_b)
 
-    # BGR → RGB → PIL
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb)
+    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 
 # ────────────────────────────────────────────────
-# Streamlit UI
+# UI
 # ────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="수중 사진 보정",
-    page_icon="🐟",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-# ─ 헤더 스타일 ─
-st.markdown("""
-<style>
-    /* 전체 배경 */
-    .stApp { background: #0a0e1a; color: #e8eaf6; }
-    /* 헤더 영역 */
-    .hero-header {
-        background: linear-gradient(135deg, #0d1b3e 0%, #0a2744 50%, #0d1f3c 100%);
-        border-bottom: 1px solid #1e3a5f;
-        padding: 2rem 2.5rem 1.5rem;
-        margin: -1rem -1rem 2rem;
-    }
-    .hero-title {
-        font-size: 2.2rem;
-        font-weight: 700;
-        background: linear-gradient(90deg, #4fc3f7, #81d4fa, #b3e5fc);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin: 0 0 .4rem;
-    }
-    .hero-sub {
-        color: #7986cb;
-        font-size: .95rem;
-        margin: 0;
-    }
-    /* 보정 버튜 */
-    .stButton > button {
-        background: linear-gradient(135deg, #1565c0, #0d47a1);
-        color: #fff;
-        border: none;
-        border-radius: 12px;
-        font-size: 1.15rem;
-        font-weight: 700;
-        padding: .8rem 2.5rem;
-        width: 100%;
-        cursor: pointer;
-        transition: opacity .2s;
-    }
-    .stButton > button:hover { opacity: .85; }
-    /* 아나리시스 배지 */
-    .badge-box {
-        background: #0d1b3e;
-        border: 1px solid #1e3a5f;
-        border-radius: 10px;
-        padding: 1rem 1.4rem;
-        margin: 1rem 0;
-        font-size: .85rem;
-        color: #90caf9;
-        line-height: 1.7;
-    }
-    .badge-box b { color: #4fc3f7; }
-    /* 이미지 라벨 */
-    .img-label {
-        text-align: center;
-        font-size: .9rem;
-        font-weight: 600;
-        margin-bottom: .4rem;
-        letter-spacing: .06em;
-    }
-    .label-before { color: #ef9a9a; }
-    .label-after  { color: #a5d6a7; }
-</style>
-""", unsafe_allow_html=True)
-
-# Hero
 st.markdown("""
 <div class="hero-header">
-    <p class="hero-title">🐙 수중 사진 자동 보정</p>
-    <p class="hero-sub">업로드 한 장·버튼 클릭 한 번&nbsp;&mdash;&nbsp;전문가가 직접 보정한 것 같은 결과물</p>
+  <div class="hero-title">🌊 수중 사진 자동 보정</div>
+  <div class="hero-sub">업로드 → 보정 실행 한 번으로 전문가급 결과물</div>
 </div>
 """, unsafe_allow_html=True)
 
-# 파일 업로더
 uploaded = st.file_uploader(
-    "수중 사진을 업로드하세요 (JPG / PNG)",
+    "사진을 선택하세요 (JPG / PNG)",
     type=["jpg", "jpeg", "png"],
-    label_visibility="collapsed",
+    label_visibility="visible",
 )
 
 if uploaded:
-    # 사진 로드 & 안전 리사이즈
     pil_orig = Image.open(uploaded).convert("RGB")
-    pil_orig = safe_resize(pil_orig, max_px=2400)
+    pil_resized = safe_resize(pil_orig, max_px=2400)
 
-    # 보정 실행 버튜
-    run_btn = st.button("🎨 보정 실행")
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_btn, _ = st.columns([2, 3])
+    with col_btn:
+        run = st.button("🎨 보정 실행", use_container_width=True)
 
-    if run_btn:
-        with st.spinner("이미지 분석 중… 최적 보정 파라미터 쪼고 있어요 🤓"):
-            bgr_orig = cv2.cvtColor(np.array(pil_orig), cv2.COLOR_RGB2BGR)
-            params  = analyze_image(bgr_orig)
-            pil_out = enhance_underwater(pil_orig, params)
+    if run:
+        with st.spinner("이미지 분석 중…"):
+            bgr_for_analysis = cv2.cvtColor(
+                np.array(pil_resized), cv2.COLOR_RGB2BGR
+            )
+            params = analyze_image(bgr_for_analysis)
 
-        # ─ 분석 배지 ─
+        with st.spinner("전문가 보정 적용 중…"):
+            pil_result = enhance_underwater(pil_resized, params)
+
+        # ── 분석 결과 요약 뱃지 ──
+        lum_pct = int(params["_mean_lum"] * 100)
+        deficit = params["_red_deficit"]
         depth_label = (
-            "💙 서피스 (0~5m)" if params["_red_deficit"] < 0.08 else
-            "💙 중심도 (5~15m)" if params["_red_deficit"] < 0.18 else
-            "💙 심수 (15m+)"
+            "얕은 수심 (5m 미만)" if deficit < 0.06
+            else "중간 수심 (5–15m)" if deficit < 0.15
+            else "깊은 수심 (15m+)"
         )
+        lap = params["_laplacian_var"]
         clarity_label = (
-            "✨ 맑음" if params["_laplacian_var"] > 300 else
-            "🌫️ 약간 후리진" if params["_laplacian_var"] > 80 else
-            "🌫️ 후리진"
+            "선명" if lap > 200 else "약간 흐릿함" if lap > 60 else "많이 흐릿함"
         )
+
         st.markdown(f"""
-        <div class="badge-box">
-            <b>🔍 자동 분석 결과</b><br>
-            수심: {depth_label} &nbsp;|
-            선명도: {clarity_label} &nbsp;|
-            적색 보상: <b>+{int((params['red_boost']-1)*100)}%</b> &nbsp;|
-            포그 제거: <b>{int(params['defog_strength']*100)}%</b> &nbsp;|
-            채도: <b>+{int((params['saturation_boost']-1)*100)}%</b>
+        <div class="analysis-badge">
+          📊 <strong>자동 분석 결과</strong> —
+          밝기 {lum_pct}% · {depth_label} · {clarity_label}<br>
+          🔴 적색 보상 {params['red_boost']:.2f}x ·
+          🟢 녹색 억제 {int((1-params['green_suppress'])*100)}% ·
+          디포그 {int(params['defog_strength']*100)}% ·
+          채도 +{int((params['saturation_boost']-1)*100)}%
         </div>
         """, unsafe_allow_html=True)
 
-        # ─ BEFORE / AFTER ─
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown('<p class="img-label label-before">■ BEFORE (원본)</p>',
-                        unsafe_allow_html=True)
-            st.image(pil_orig, use_container_width=True)
-        with col2:
-            st.markdown('<p class="img-label label-after">■ AFTER (보정)</p>',
-                        unsafe_allow_html=True)
-            st.image(pil_out, use_container_width=True)
+        # ── 원본 / 보정 비교 ──
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown('<div class="img-label">BEFORE — 원본</div>', unsafe_allow_html=True)
+            st.image(pil_resized, use_container_width=True)
+        with c2:
+            st.markdown('<div class="img-label">AFTER — 보정 완료</div>', unsafe_allow_html=True)
+            st.image(pil_result, use_container_width=True)
 
-        # ─ 다운로드 ─
-        st.markdown("---")
-        d1, d2 = st.columns(2)
-        with d1:
+        # ── 다운로드 ──
+        st.markdown("<br>", unsafe_allow_html=True)
+        dc1, dc2, _ = st.columns([2, 2, 3])
+        stem = uploaded.name.rsplit(".", 1)[0]
+        with dc1:
             st.download_button(
-                label="⬇️ JPG 다운로드",
-                data=pil_to_bytes(pil_out, "JPEG"),
-                file_name="underwater_corrected.jpg",
+                "⬇️ JPG 다운로드",
+                data=pil_to_bytes(pil_result, "JPEG", 95),
+                file_name=f"{stem}_enhanced.jpg",
                 mime="image/jpeg",
                 use_container_width=True,
             )
-        with d2:
+        with dc2:
             st.download_button(
-                label="⬇️ PNG 다운로드",
-                data=pil_to_bytes(pil_out, "PNG"),
-                file_name="underwater_corrected.png",
+                "⬇️ PNG 다운로드",
+                data=pil_to_bytes(pil_result, "PNG"),
+                file_name=f"{stem}_enhanced.png",
                 mime="image/png",
                 use_container_width=True,
             )
     else:
-        # 버튜 누르기 전 미리보기
-        st.image(pil_orig, caption="업로드된 원본 사진", use_container_width=True)
+        # 업로드 후 미리보기
+        st.image(pil_resized, caption="업로드된 원본 사진", use_container_width=True)
 else:
     st.info("📷 JPG 또는 PNG 파일을 위에 드래그하시거나 클릭해서 업로드하세요.")
